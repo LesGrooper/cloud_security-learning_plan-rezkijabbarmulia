@@ -1,0 +1,4 @@
+{
+  "ConfigRuleName": "iam-policy-no-statements-with-admin-access",
+  "Source": {"Owner":"AWS","SourceIdentifier":"IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS"}
+}

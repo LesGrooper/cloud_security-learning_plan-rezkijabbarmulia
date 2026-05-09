@@ -1,0 +1,4 @@
+{
+  "ConfigRuleName": "mfa-enabled-for-iam-console-access",
+  "Source": {"Owner":"AWS","SourceIdentifier":"MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS"}
+}

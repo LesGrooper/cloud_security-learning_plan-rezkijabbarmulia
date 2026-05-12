@@ -302,6 +302,7 @@ aws configservice get-compliance-details-by-config-rule \
 - Design secure VPC architecture with defense-in-depth for car rental SaaS
 - Configure Security Groups (stateful) and Network ACLs (stateless)
 - Replace SSH bastion hosts with AWS Systems Manager Session Manager
+- Configure AWS Client VPN with user-group, port, and IP-based access rules
 
 > **🔐 OWASP Coverage:** [A05 Security Misconfiguration](https://owasp.org/Top10/A05_2021-Security_Misconfiguration/) · [A01 Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/)
 
@@ -447,6 +448,105 @@ aws ssm describe-instance-information \
 aws ec2 revoke-security-group-ingress --group-id $SG_APP \
   --protocol tcp --port 22 --cidr 0.0.0.0/0 2>/dev/null || echo "Port 22 not open — good"
 ```
+
+#### Step 4: AWS Client VPN — User, Port, and IP-Based Access Control
+
+```bash
+# RentDrive AWS Client VPN: WHO (AD group) + WHAT (port) + WHERE (source IP)
+REGION="ap-southeast-1"
+VPC_ID="vpc-xxxxxxxxxxxxxxxxx"
+
+# Step 1: Import server certificate into ACM
+aws acm import-certificate \
+  --certificate fileb://server.crt \
+  --private-key fileb://server.key \
+  --certificate-chain fileb://ca.crt \
+  --region $REGION
+
+SERVER_CERT_ARN=$(aws acm list-certificates --region $REGION \
+  --query "CertificateSummaryList[?DomainName=='vpn.rentdrive.internal'].CertificateArn" \
+  --output text)
+
+# Step 2: Create Client VPN endpoint (AD auth + split-tunnel)
+VPN_ENDPOINT_ID=$(aws ec2 create-client-vpn-endpoint \
+  --client-cidr-block "10.200.0.0/22" \
+  --server-certificate-arn "$SERVER_CERT_ARN" \
+  --authentication-options Type=directory-service-authentication,ActiveDirectory.DirectoryId=d-xxxxxxxxxx \
+  --connection-log-options Enabled=true,CloudwatchLogGroup=/rentdrive/vpn/connections,CloudwatchLogStream=prod \
+  --transport-protocol udp --vpn-port 443 \
+  --split-tunnel \
+  --tags Key=Environment,Value=production \
+  --query ClientVpnEndpointId --output text)
+
+# Step 3: Associate with private subnet
+aws ec2 associate-client-vpn-target-network \
+  --client-vpn-endpoint-id "$VPN_ENDPOINT_ID" \
+  --subnet-id "subnet-xxxxxxxxxxxxxxxxx"
+
+# Step 4: Authorization rules — USER-GROUP based access control
+# Engineering: app subnet only
+aws ec2 authorize-client-vpn-ingress \
+  --client-vpn-endpoint-id "$VPN_ENDPOINT_ID" \
+  --target-network-cidr "10.0.1.0/24" \
+  --access-group-id "engineering-group-id" \
+  --description "Engineering: app-tier subnet only"
+
+# DBA team: database subnet only
+aws ec2 authorize-client-vpn-ingress \
+  --client-vpn-endpoint-id "$VPN_ENDPOINT_ID" \
+  --target-network-cidr "10.0.3.0/24" \
+  --access-group-id "dba-team-group-id" \
+  --description "DBA Team: DB subnet only"
+
+# DevOps: full private VPC
+aws ec2 authorize-client-vpn-ingress \
+  --client-vpn-endpoint-id "$VPN_ENDPOINT_ID" \
+  --target-network-cidr "10.0.0.0/16" \
+  --access-group-id "devops-group-id" \
+  --description "DevOps: full VPC access"
+
+# Step 5: Security Group — port-level restriction per role
+SG_VPN=$(aws ec2 create-security-group \
+  --group-name "rentdrive-vpn-clients" \
+  --description "VPN client traffic — port-restricted" \
+  --vpc-id $VPC_ID --query GroupId --output text)
+
+# Engineers: HTTPS (443) + admin (8443) only
+aws ec2 authorize-security-group-ingress --group-id $SG_VPN \
+  --protocol tcp --port 443 --cidr 10.200.0.0/22
+aws ec2 authorize-security-group-ingress --group-id $SG_VPN \
+  --protocol tcp --port 8443 --cidr 10.200.0.0/22
+
+# DBAs: MySQL (3306) from VPN CIDR only
+aws ec2 authorize-security-group-ingress --group-id "sg-db-tier" \
+  --protocol tcp --port 3306 --source-group $SG_VPN
+
+# Step 6: IP monitoring — CloudWatch Logs Insights (run daily)
+# Log group: /rentdrive/vpn/connections
+# fields @timestamp, connectionAttemptStatus, clientIp, username
+# | filter connectionAttemptStatus = "successful"
+# | filter not isIpInCidr(clientIp, "103.0.0.0/8")   -- approved office ISP
+# | filter not isIpInCidr(clientIp, "180.0.0.0/8")   -- approved remote ISP
+# | sort @timestamp desc | limit 50
+
+# Step 7: Verify active VPN connections
+aws ec2 describe-client-vpn-connections \
+  --client-vpn-endpoint-id "$VPN_ENDPOINT_ID" \
+  --filters Name=status,Values=active \
+  --query "Connections[].{User:Username,IP:ClientIp,Since:ConnectionEstablishedTime}" \
+  --output table
+```
+
+**VPN Access Matrix — RentDrive**
+
+| User Group | VPN CIDR | Allowed Destination | Ports | MFA |
+|------------|----------|---------------------|-------|-----|
+| `engineering` | 10.200.0.0/25 | App subnet 10.0.1.0/24 | 443, 8443 | Yes (AD MFA) |
+| `dba-team` | 10.200.0.128/26 | DB subnet 10.0.3.0/24 | 3306 only | Yes (AD MFA) |
+| `devops` | 10.200.0.192/26 | Full VPC 10.0.0.0/16 | All private | Yes (AD MFA) |
+| `readonly-audit` | 10.200.1.0/25 | Log Archive account | 443 only | Yes (AD MFA) |
+
+> No group is authorized to `0.0.0.0/0`. Split-tunnel: only RFC 1918 traffic routes through VPN.
 
 #### 🔐 OWASP A05 — Policy to AWS Implementation
 
@@ -960,6 +1060,7 @@ aws cloudtrail validate-logs \
 - Automate CVE detection with Amazon Inspector v2 across EC2 and ECR
 - Automate OS patching with AWS Systems Manager Patch Manager
 - Enforce compliance baseline with AWS Config + CIS rules
+- Integrate SAST (Semgrep/Bandit) and DAST (OWASP ZAP) into the CI/CD pipeline
 
 > **🔐 OWASP Coverage:** [A06 Vulnerable & Outdated Components](https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/)
 
@@ -1079,6 +1180,172 @@ aws ssm send-command \
   --output-s3-bucket-name "rentdrive-cloudtrail-$(aws sts get-caller-identity --query Account --output text)" \
   --output-s3-key-prefix "ssm-run-command-output/"
 ```
+
+#### Step 4: SAST + DAST — Server-Side Security Testing Pipeline
+
+```bash
+# ── SAST: Static Application Security Testing ────────────────────────────────
+# Runs INSIDE the CI pipeline (CodeBuild) — catches vulnerabilities BEFORE deployment
+
+# CodeBuild buildspec.yml — SAST stage integrated into CI pipeline
+cat << 'SASTEOF' > /tmp/sast-buildspec.yml
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install semgrep bandit safety
+      - npm install -g @bearer/cli
+  pre_build:
+    commands:
+      - echo "=== SAST Phase: scanning source code before build ==="
+  build:
+    commands:
+      # Semgrep: OWASP Top 10 + AWS security rules on the booking API source
+      - semgrep --config "p/owasp-top-ten" --config "p/aws-lambda" --config "p/secrets"
+          --json --output /tmp/semgrep-results.json ./src/
+          --error    # fail build if any HIGH/CRITICAL findings
+
+      # Bandit: Python-specific security linter (SQL injection, hardcoded secrets)
+      - bandit -r ./src/ -f json -o /tmp/bandit-results.json -ll
+          --exit-zero
+
+      # Safety: check Python dependencies against known CVE database
+      - safety check -r requirements.txt --json > /tmp/safety-results.json
+
+      # Bearer: detect PII leakage in code (driver license, credit card patterns)
+      - bearer scan ./src/ --format json --output /tmp/bearer-results.json
+          --severity critical,high
+
+  post_build:
+    commands:
+      - echo "Uploading SAST results to S3 for audit trail"
+      - aws s3 cp /tmp/semgrep-results.json s3://rentdrive-security-reports/sast/$(date +%Y%m%d)/
+      - aws s3 cp /tmp/bandit-results.json  s3://rentdrive-security-reports/sast/$(date +%Y%m%d)/
+      - aws s3 cp /tmp/safety-results.json  s3://rentdrive-security-reports/sast/$(date +%Y%m%d)/
+      # Publish SAST finding count to CloudWatch (track trend over sprints)
+      - |
+        CRITICAL_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/semgrep-results.json')); print(len([r for r in d.get('results',[]) if r.get('extra',{}).get('severity','')=='ERROR']))")
+        aws cloudwatch put-metric-data --namespace SAST/RentDrive           --metric-name CriticalFindings --value $CRITICAL_COUNT           --dimensions Pipeline=booking-api
+artifacts:
+  files:
+    - /tmp/*-results.json
+  base-directory: /tmp
+  name: sast-reports-$(date +%Y%m%d)
+SASTEOF
+
+# Create CodeBuild SAST project
+aws codebuild create-project \
+  --name "rentdrive-booking-api-sast" \
+  --description "SAST scan: Semgrep + Bandit + Safety + Bearer" \
+  --source '{"type":"CODECOMMIT","location":"https://git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/booking-api","buildspec":"sast-buildspec.yml"}' \
+  --artifacts '{"type":"S3","location":"rentdrive-security-reports","path":"sast/","name":"sast-reports","packaging":"ZIP"}' \
+  --environment '{"type":"LINUX_CONTAINER","computeType":"BUILD_GENERAL1_SMALL","image":"aws/codebuild/standard:7.0","environmentVariables":[{"name":"ENV","value":"ci","type":"PLAINTEXT"}]}' \
+  --service-role "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/CodeBuildSASTRole"
+
+echo "SAST project created: rentdrive-booking-api-sast"
+echo "Runs on every commit — blocks deploy if CRITICAL findings exist"
+
+# ── DAST: Dynamic Application Security Testing ───────────────────────────────
+# Runs AGAINST the live UAT environment — black-box testing of the running API
+
+# Step 1: Deploy OWASP ZAP as a CodeBuild task targeting UAT
+cat << 'DASTEOF' > /tmp/dast-buildspec.yml
+version: 0.2
+phases:
+  install:
+    commands:
+      - apt-get update && apt-get install -y default-jre wget
+      - wget -q https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
+      - tar -xzf ZAP_2.14.0_Linux.tar.gz
+  build:
+    commands:
+      - UAT_URL="https://api-uat.rentdrive.internal"
+      - echo "=== DAST Phase: scanning $UAT_URL ==="
+
+      # Full active scan: tests OWASP Top 10 against booking API endpoints
+      - ./ZAP_2.14.0/zap.sh -cmd
+          -quickurl $UAT_URL
+          -quickprogress
+          -quickout /tmp/zap-report.html
+
+      # API-specific scan using OpenAPI spec (catches BOLA, auth bypass, injection)
+      - ./ZAP_2.14.0/zap.sh -cmd
+          -port 8090
+          -config api.addrs.addr.name=.*
+          -config api.addrs.addr.regex=true
+          -addoninstall openapi
+          -openapi $UAT_URL/openapi.json $UAT_URL
+          -report /tmp/zap-api-report.html
+
+      # Count HIGH/CRITICAL alerts — fail pipeline if found
+      - |
+        HIGH_COUNT=$(grep -c "High" /tmp/zap-report.html || true)
+        echo "ZAP HIGH findings: $HIGH_COUNT"
+        if [ "$HIGH_COUNT" -gt "0" ]; then
+          echo "DAST FAILED: $HIGH_COUNT HIGH severity findings — block PROD promotion"
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - aws s3 cp /tmp/zap-report.html     s3://rentdrive-security-reports/dast/$(date +%Y%m%d)/
+      - aws s3 cp /tmp/zap-api-report.html s3://rentdrive-security-reports/dast/$(date +%Y%m%d)/
+      - |
+        aws cloudwatch put-metric-data --namespace DAST/RentDrive           --metric-name HighFindings --value $(grep -c "High" /tmp/zap-report.html || echo 0)           --dimensions Target=booking-api-uat
+DASTEOF
+
+# Create CodeBuild DAST project (targets UAT — never runs against PROD directly)
+aws codebuild create-project \
+  --name "rentdrive-booking-api-dast" \
+  --description "DAST scan: OWASP ZAP against UAT booking API" \
+  --source '{"type":"NO_SOURCE","buildspec":"dast-buildspec.yml"}' \
+  --artifacts '{"type":"S3","location":"rentdrive-security-reports","path":"dast/","name":"dast-reports","packaging":"ZIP"}' \
+  --environment '{"type":"LINUX_CONTAINER","computeType":"BUILD_GENERAL1_MEDIUM","image":"aws/codebuild/standard:7.0","environmentVariables":[{"name":"TARGET_ENV","value":"uat","type":"PLAINTEXT"}]}' \
+  --service-role "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/CodeBuildDASTRole" \
+  --vpc-config vpcId=$VPC_ID,subnets=[subnet-uat-app1],securityGroupIds=[sg-uat-dast]
+
+# Step 2: CloudWatch alarm — DAST HIGH finding spike (regression detection)
+aws cloudwatch put-metric-alarm \
+  --alarm-name "DAST-HighFindingsSpike-BookingAPI" \
+  --namespace DAST/RentDrive --metric-name HighFindings \
+  --statistic Sum --period 86400 --threshold 0 \
+  --comparison-operator GreaterThanThreshold --evaluation-periods 1 \
+  --alarm-actions "$SNS_ARN" \
+  --alarm-description "DAST: HIGH finding detected in UAT — block PROD deployment, review immediately"
+
+echo "DAST project created: rentdrive-booking-api-dast"
+echo "Runs against UAT after each deploy — blocks PROD gate if HIGH/CRITICAL ZAP findings"
+
+# ── S3 security reports bucket — centralized audit trail ─────────────────────
+aws s3api create-bucket \
+  --bucket "rentdrive-security-reports-$(aws sts get-caller-identity --query Account --output text)" \
+  --region $REGION --create-bucket-configuration LocationConstraint=$REGION
+
+# Enforce immutability: security reports cannot be deleted for 90 days (audit requirement)
+aws s3api put-object-lock-configuration \
+  --bucket "rentdrive-security-reports-$(aws sts get-caller-identity --query Account --output text)" \
+  --object-lock-configuration '{
+    "ObjectLockEnabled":"Enabled",
+    "Rule":{"DefaultRetention":{"Mode":"COMPLIANCE","Days":90}}
+  }'
+
+echo "Security reports bucket: Object Lock COMPLIANCE 90 days — reports are immutable"
+```
+
+**SAST vs DAST Summary**
+
+| | SAST | DAST |
+|---|---|---|
+| **When** | Pre-build (every commit) | Post-deploy (UAT environment) |
+| **What it tests** | Source code, dependencies, secrets, PII patterns | Running API: injection, auth, headers, business logic |
+| **Tools** | Semgrep, Bandit, Safety, Bearer | OWASP ZAP v2.14 |
+| **AWS service** | CodeBuild in CI pipeline | CodeBuild targeting UAT VPC |
+| **Failure action** | Block build — code never deployed | Block PROD gate — dev fixes before promotion |
+| **Reports stored** | S3 `sast/YYYYMMDD/` | S3 `dast/YYYYMMDD/` |
+| **OWASP alignment** | A03 (injection), A06 (deps), A02 (crypto), A07 (auth) | A01–A10 full scan, API Top 10 |
+| **Metric** | `SAST/RentDrive:CriticalFindings` | `DAST/RentDrive:HighFindings` |
 
 #### 🔐 OWASP A06 — Policy to AWS Implementation
 
@@ -2015,6 +2282,236 @@ echo "OWASP ASVS Level 3 verification complete — all controls validated"
 - **IAM Permission Boundaries**: even a compromised role cannot `CreateRole` or modify IAM policies
 
 ---
+
+## 🏗️ Environment Clustering — DEV / UAT / PROD
+
+> This section extends the AWS Organizations multi-account governance (Day 10) with concrete **EKS cluster isolation**, **RDS instance tiering**, and **network segmentation** for the three RentDrive environments.
+
+### Environment Architecture Overview
+
+```
+AWS Organizations
+├── Management Account   (SCPs + billing — no workloads)
+├── Security OU
+│   ├── Security Tooling Account
+│   └── Log Archive Account
+└── Workloads OU
+    ├── PROD Account  (account-prod-123)   ← live customers, strict SCPs
+    ├── UAT Account   (account-uat-456)    ← pre-release validation, partial SCPs
+    └── DEV Account   (account-dev-789)    ← developer sandbox, relaxed SCPs
+```
+
+### Cluster Segmentation Rules
+
+| Dimension | DEV | UAT | PROD |
+|-----------|-----|-----|------|
+| AWS Account | Separate | Separate | Separate |
+| EKS Cluster | `rentdrive-dev` | `rentdrive-uat` | `rentdrive-prod` |
+| EKS Namespace | `dev-*` | `uat-*` | `prod-*` |
+| RDS Instance | `db.t3.micro` (no Multi-AZ) | `db.t3.small` (no Multi-AZ) | `db.r6g.large` (Multi-AZ) |
+| S3 Bucket Prefix | `rentdrive-dev-*` | `rentdrive-uat-*` | `rentdrive-prod-*` |
+| Public Internet Access | Allowed (dev work) | Internal + VPN only | VPN only (no SSH) |
+| Data | Anonymized/synthetic | Anonymized copy of prod | Live customer data |
+| Deployment Trigger | Any branch push | `release/*` branch | `main` tag only |
+| GuardDuty | Optional | Enabled | Enabled + enforced via SCP |
+
+### Lab — EKS Cluster Per Environment + RBAC Isolation
+
+```bash
+REGION="ap-southeast-1"
+
+# ── Create EKS Clusters (one per environment account) ────────────────────────
+# Run each block from the respective AWS account context
+
+# PROD cluster — private endpoint, locked-down node groups
+aws eks create-cluster \
+  --name "rentdrive-prod" \
+  --kubernetes-version "1.29" \
+  --role-arn "arn:aws:iam::PROD_ACCOUNT_ID:role/EKSClusterRole" \
+  --resources-vpc-config \
+    subnetIds=subnet-prod-app1,subnet-prod-app2,\
+    securityGroupIds=sg-prod-eks,\
+    endpointPublicAccess=false,\
+    endpointPrivateAccess=true,\
+    publicAccessCidrs=[] \
+  --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}' \
+  --tags Environment=prod,CostCenter=rentdrive-platform
+
+# UAT cluster — private endpoint, allow VPN CIDR for kubectl access
+aws eks create-cluster \
+  --name "rentdrive-uat" \
+  --kubernetes-version "1.29" \
+  --role-arn "arn:aws:iam::UAT_ACCOUNT_ID:role/EKSClusterRole" \
+  --resources-vpc-config \
+    subnetIds=subnet-uat-app1,subnet-uat-app2,\
+    securityGroupIds=sg-uat-eks,\
+    endpointPublicAccess=true,\
+    endpointPrivateAccess=true,\
+    publicAccessCidrs="10.200.0.0/22" \
+  --tags Environment=uat,CostCenter=rentdrive-platform
+
+# DEV cluster — public endpoint OK for developer access
+aws eks create-cluster \
+  --name "rentdrive-dev" \
+  --kubernetes-version "1.29" \
+  --role-arn "arn:aws:iam::DEV_ACCOUNT_ID:role/EKSClusterRole" \
+  --resources-vpc-config \
+    subnetIds=subnet-dev-app1,subnet-dev-app2,\
+    securityGroupIds=sg-dev-eks,\
+    endpointPublicAccess=true,\
+    endpointPrivateAccess=true,\
+    publicAccessCidrs="0.0.0.0/0" \
+  --tags Environment=dev,CostCenter=rentdrive-platform
+
+# ── Kubernetes RBAC — namespace isolation per environment ─────────────────────
+# Apply to each cluster via kubectl (after aws eks update-kubeconfig)
+
+cat << 'RBACEOF' | kubectl apply -f -
+# Namespace isolation: dev engineers CANNOT access prod/uat namespaces
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod-booking-api
+  labels:
+    environment: prod
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prod-readonly-binding
+  namespace: prod-booking-api
+subjects:
+  - kind: Group
+    name: "rentdrive:devops"       # only devops group has prod access
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-fullaccess-binding
+  namespace: dev-booking-api
+subjects:
+  - kind: Group
+    name: "rentdrive:engineering"  # all engineers can edit dev namespace
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: edit
+  apiGroup: rbac.authorization.k8s.io
+RBACEOF
+
+# ── SCP: PROD Account — block manual EC2/RDS creation (CI/CD only) ────────────
+# This SCP was created in Day 10; attach to PROD OU target
+aws organizations create-policy \
+  --name "ProdImmutableInfra" \
+  --description "PROD: all infra changes must go through CodePipeline — no manual console changes" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version":"2012-10-17",
+    "Statement":[
+      {
+        "Sid":"DenyManualEC2InProd",
+        "Effect":"Deny",
+        "Action":["ec2:RunInstances","rds:CreateDBInstance","eks:CreateNodegroup"],
+        "Resource":"*",
+        "Condition":{
+          "StringNotLike":{"aws:CalledViaFirst":"codepipeline.amazonaws.com"}
+        }
+      }
+    ]
+  }'
+
+# ── RDS: environment-appropriate instance class + Multi-AZ ───────────────────
+# PROD: Multi-AZ r6g.large
+aws rds create-db-instance \
+  --db-instance-identifier "rentdrive-prod-mysql" \
+  --db-instance-class db.r6g.large \
+  --engine mysql --engine-version "8.0" \
+  --multi-az \
+  --storage-encrypted \
+  --kms-key-id "alias/rentdrive-prod-rds" \
+  --no-publicly-accessible \
+  --db-subnet-group-name "rentdrive-prod-dbsubnet" \
+  --tags Key=Environment,Value=prod
+
+# UAT: no Multi-AZ (save cost), same encryption
+aws rds create-db-instance \
+  --db-instance-identifier "rentdrive-uat-mysql" \
+  --db-instance-class db.t3.small \
+  --engine mysql --engine-version "8.0" \
+  --no-multi-az \
+  --storage-encrypted \
+  --kms-key-id "alias/rentdrive-uat-rds" \
+  --no-publicly-accessible \
+  --tags Key=Environment,Value=uat
+
+# DEV: t3.micro, no encryption required (only synthetic data)
+aws rds create-db-instance \
+  --db-instance-identifier "rentdrive-dev-mysql" \
+  --db-instance-class db.t3.micro \
+  --engine mysql --engine-version "8.0" \
+  --no-multi-az \
+  --no-storage-encrypted \
+  --tags Key=Environment,Value=dev
+
+# ── CodePipeline: environment-gated deployment pipeline ──────────────────────
+# Promotion path: DEV → UAT (auto on green tests) → PROD (manual approval gate)
+aws codepipeline create-pipeline --pipeline '{
+  "name": "rentdrive-booking-api-pipeline",
+  "roleArn": "arn:aws:iam::PROD_ACCOUNT_ID:role/CodePipelineRole",
+  "artifactStore": {"type":"S3","location":"rentdrive-pipeline-artifacts"},
+  "stages": [
+    {
+      "name": "Source",
+      "actions": [{"name":"GitHub","actionTypeId":{"category":"Source","owner":"ThirdParty","provider":"GitHub","version":"1"},"outputArtifacts":[{"name":"source"}],"configuration":{"Owner":"rentdrive","Repo":"booking-api","Branch":"main"}}]
+    },
+    {
+      "name": "Deploy-DEV",
+      "actions": [{"name":"DeployDev","actionTypeId":{"category":"Deploy","owner":"AWS","provider":"EKS","version":"1"},"inputArtifacts":[{"name":"source"}],"configuration":{"ClusterName":"rentdrive-dev","Namespace":"dev-booking-api"}}]
+    },
+    {
+      "name": "Deploy-UAT",
+      "actions": [{"name":"DeployUAT","actionTypeId":{"category":"Deploy","owner":"AWS","provider":"EKS","version":"1"},"inputArtifacts":[{"name":"source"}],"configuration":{"ClusterName":"rentdrive-uat","Namespace":"uat-booking-api"}}]
+    },
+    {
+      "name": "Approve-PROD",
+      "actions": [{"name":"ManualApproval","actionTypeId":{"category":"Approval","owner":"AWS","provider":"Manual","version":"1"},"configuration":{"NotificationArn":"arn:aws:sns:ap-southeast-1:PROD_ACCOUNT_ID:rentdrive-security-alerts","CustomData":"Security sign-off required before PROD deploy"}}]
+    },
+    {
+      "name": "Deploy-PROD",
+      "actions": [{"name":"DeployProd","actionTypeId":{"category":"Deploy","owner":"AWS","provider":"EKS","version":"1"},"inputArtifacts":[{"name":"source"}],"configuration":{"ClusterName":"rentdrive-prod","Namespace":"prod-booking-api"}}]
+    }
+  ]
+}'
+echo "Pipeline: DEV → UAT (auto) → PROD (manual security approval gate)"
+
+# ── Verify cluster isolation ──────────────────────────────────────────────────
+for ENV in dev uat prod; do
+  echo "=== $ENV cluster ==="
+  aws eks describe-cluster --name "rentdrive-$ENV" \
+    --query 'cluster.{Status:status,Endpoint:endpoint,PublicAccess:resourcesVpcConfig.endpointPublicAccess,PrivateAccess:resourcesVpcConfig.endpointPrivateAccess}' \
+    --output table 2>/dev/null || echo "  (run from $ENV account context)"
+done
+```
+
+### Environment Promotion Checklist
+
+```
+Before promoting UAT → PROD:
+☑ All DAST scans on UAT passed (0 HIGH/CRITICAL findings) — see DAST/SAST section
+☑ SAST scan green in CI pipeline (no new security findings vs previous release)
+☑ Inspector v2: 0 CRITICAL CVEs in UAT container images
+☑ AWS Config compliance score > 95% in UAT account
+☑ Security Hub: 0 unresolved CRITICAL findings in UAT
+☑ Load test completed: p99 latency within SLA
+☑ Manual security sign-off from Security Lead
+☑ CodePipeline manual approval gate approved
+```
 
 ## 🗓️ DAY 10 — Enterprise Security Operations & Governance
 
